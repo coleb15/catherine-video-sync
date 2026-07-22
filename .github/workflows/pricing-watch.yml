@@ -1,0 +1,48 @@
+name: Watch Framer Server API Pricing
+
+on:
+  schedule:
+    # Weekly, Monday 09:43 UTC (off-minute).
+    - cron: "43 9 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install exact pinned dependencies
+        run: npm ci
+
+      - name: Check pricing page
+        id: check
+        run: node scripts/check-pricing.mjs >> "$GITHUB_OUTPUT"
+
+      - name: Commit updated snapshot
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- .pricing-snapshot.txt; then
+            git add .pricing-snapshot.txt
+            git commit -m "Update pricing page snapshot"
+            git push
+          fi
+
+      - name: Open issue if pricing may have changed
+        if: steps.check.outputs.PRICING_ALERT == 'true'
+        run: |
+          gh issue create \
+            --title "Framer Server API pricing may have changed" \
+            --body "The weekly pricing-watch check found language on https://www.framer.com/developers/server-api-faq that looks like it may no longer say the API is free during beta. Check the page directly and, if pricing has started, update the video-sync workflow's budget assumptions (see README)."
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,0 +1,50 @@
+name: Sync Commission Videos
+
+on:
+  schedule:
+    # Daily at 03:17 UTC (off-minute, low-traffic time). Adjust freely — this
+    # isn't latency sensitive, Catherine's uploads are infrequent.
+    - cron: "17 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install exact pinned dependencies
+        run: npm ci
+
+      - name: Ensure ffmpeg is installed
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+
+      - name: Run sync
+        env:
+          FRAMER_API_KEY: ${{ secrets.FRAMER_API_KEY }}
+          FRAMER_PROJECT_URL: ${{ secrets.FRAMER_PROJECT_URL }}
+        run: npm run sync
+
+      - name: Commit updated sync state
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- .sync-state.json; then
+            git add .sync-state.json
+            git commit -m "Update sync state"
+            git push
+          fi
