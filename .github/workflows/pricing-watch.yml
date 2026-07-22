@@ -26,7 +26,7 @@ jobs:
 
       - name: Check pricing page
         id: check
-        run: node scripts/check-pricing.mjs >> "$GITHUB_OUTPUT"
+        run: node scripts/check-pricing.mjs
 
       - name: Commit updated snapshot
         run: |
