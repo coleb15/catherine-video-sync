@@ -2,9 +2,9 @@ name: Sync Commission Videos
 
 on:
   schedule:
-    # TEMPORARY for testing autonomous firing — will be reset to the real
-    # daily schedule right after confirming this fires on its own.
-    - cron: "25 22 * * *"
+    # Daily at 03:17 UTC (off-minute, low-traffic time). Adjust freely — this
+    # isn't latency sensitive, Catherine's uploads are infrequent.
+    - cron: "17 3 * * *"
   workflow_dispatch: {}
 
 permissions:
