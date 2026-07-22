@@ -2,10 +2,17 @@ name: Sync Commission Videos
 
 on:
   schedule:
-    # Daily at 03:17 UTC (off-minute, low-traffic time). Adjust freely — this
-    # isn't latency sensitive, Catherine's uploads are infrequent.
-    - cron: "17 3 * * *"
+    # Every 5 minutes, so a new upload shows up on the live site in minutes,
+    # not up to a day later.
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
+
+# Prevents overlapping runs: if one run is still going (e.g. processing a
+# large video) when the next 5-minute trigger fires, the new one queues
+# instead of running concurrently and racing on git pushes / the same items.
+concurrency:
+  group: sync-videos
+  cancel-in-progress: false
 
 permissions:
   contents: write

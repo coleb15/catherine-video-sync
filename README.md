@@ -47,10 +47,12 @@ about optimization; it just happens.
 
 ## How it works
 
-- `scripts/sync-videos.mjs` runs on a daily schedule (`.github/workflows/sync-videos.yml`).
+- `scripts/sync-videos.mjs` runs every 5 minutes (`.github/workflows/sync-videos.yml`), so
+  a new upload shows up optimized on the live site within minutes, not up to a day later.
   It checks every item in the "Commissions" collection for a video in the upload field
   that hasn't been synced yet, downloads it, runs it through ffmpeg, and uploads the
-  result via Framer's Server API into the render field.
+  result via Framer's Server API into the render field. Overlapping runs are prevented
+  (`concurrency` in the workflow file) so a slow run never races the next trigger.
 - `scripts/check-pricing.mjs` runs weekly (`.github/workflows/pricing-watch.yml`). Framer's
   Server API is in beta and currently free; Framer has said they'll likely charge per-use
   once it leaves beta, with no announced timeline. This watches their FAQ page for
