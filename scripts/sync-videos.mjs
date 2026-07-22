@@ -32,9 +32,16 @@
 //    consistency rigorously first — it silently failed in exactly this way
 //    multiple times during development, including after read-after-write
 //    verification within the writing connection itself.
+//
+// 3. A successful-looking ffmpeg run is not proof of a correct output — a
+//    corrupt/truncated source can produce a tiny or zero-duration file
+//    without ffmpeg itself erroring. checkOutputSanity() below verifies the
+//    output file size and duration before it's ever uploaded, so a bad
+//    input becomes a loud failure (and a GitHub notification) instead of a
+//    broken video silently going live.
 import { connect, isRetryableError } from "framer-api";
 import { execFileSync } from "node:child_process";
-import { writeFileSync, readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, statSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -55,6 +62,7 @@ const STATE_PATH = join(__dirname, "..", ".sync-state.json");
 
 const FFMPEG_ARGS = [
   "-vf", "scale=960:-2",
+  "-pix_fmt", "yuv420p",
   "-c:v", "libx264",
   "-preset", "slow",
   "-crf", "20",
@@ -64,6 +72,9 @@ const FFMPEG_ARGS = [
   "-b:a", "128k",
   "-movflags", "+faststart",
 ];
+
+const MIN_OUTPUT_BYTES = 20_000; // catches empty/near-empty output
+const DURATION_TOLERANCE_SECONDS = 3; // vs. the source's own duration
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -97,6 +108,42 @@ async function withRetries(label, fn, attempts = 3) {
     }
   }
   throw lastError;
+}
+
+function getDurationSeconds(path) {
+  const out = execFileSync("ffprobe", [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    path,
+  ]).toString().trim();
+  const seconds = parseFloat(out);
+  if (Number.isNaN(seconds)) throw new Error(`ffprobe returned a non-numeric duration: "${out}"`);
+  return seconds;
+}
+
+// Verifies the optimized file is a real, complete video roughly matching the
+// source's length — not just "ffmpeg exited 0". Throws (a real failure) if
+// anything looks wrong, rather than letting a broken file get uploaded.
+function checkOutputSanity(rawPath, optimizedPath) {
+  const size = statSync(optimizedPath).size;
+  if (size < MIN_OUTPUT_BYTES) {
+    throw new Error(`Optimized output is suspiciously small (${size} bytes) — likely a broken/corrupt source file.`);
+  }
+
+  const sourceDuration = getDurationSeconds(rawPath);
+  const outputDuration = getDurationSeconds(optimizedPath);
+  const diff = Math.abs(sourceDuration - outputDuration);
+
+  if (diff > DURATION_TOLERANCE_SECONDS) {
+    throw new Error(
+      `Optimized output duration (${outputDuration.toFixed(1)}s) doesn't match source ` +
+      `(${sourceDuration.toFixed(1)}s) — off by ${diff.toFixed(1)}s. Source may be corrupt ` +
+      `or the encode may have failed partway through.`
+    );
+  }
+
+  console.log(`Sanity check passed: ${size} bytes, ${outputDuration.toFixed(1)}s (source: ${sourceDuration.toFixed(1)}s).`);
 }
 
 // Runs `work(framer, collection, fields)` against a brand-new connection,
@@ -167,6 +214,8 @@ async function processItem(slug, state) {
 
       execFileSync("ffmpeg", ["-y", "-i", rawPath, ...FFMPEG_ARGS, optimizedPath], { stdio: "inherit" });
 
+      checkOutputSanity(rawPath, optimizedPath);
+
       const optimizedBytes = readFileSync(optimizedPath);
 
       const uploaded = await withRetries(`upload:${slug}`, () =>
@@ -203,7 +252,8 @@ async function processItem(slug, state) {
       // The authoritative "already synced" record — this repo, not Framer.
       // Keeps the previous render URL too, so a bad sync can be rolled back
       // with `node scripts/rollback.mjs <slug>` (see README).
-      const previousRenderUrl = state[item.id]?.renderUrl;
+      const previousRenderUrl = state[item.id]?.renderUrl ?? state[`removed:${slug}`]?.previousRenderUrl;
+      delete state[`removed:${slug}`]; // clean up if this item was cleared and is now re-uploaded
       state[item.id] = {
         slug,
         lastSyncedSourceAssetId: asset.id,
@@ -219,6 +269,51 @@ async function processItem(slug, state) {
   });
 }
 
+// Handles an item that WAS previously synced by this script but no longer
+// has anything in the upload field — i.e. someone removed the video. Clears
+// the render field too, rather than leaving a stale optimized video live
+// forever with no upload behind it.
+async function clearItem(slug, state) {
+  return withFreshCollection(async (_framer, collection, fields) => {
+    const items = await collection.getItems();
+    const item = items.find((i) => i.slug === slug);
+    if (!item) {
+      throw new Error(`Item "${slug}" disappeared between the scan pass and processing.`);
+    }
+
+    const entryId = Object.keys(state).find((id) => state[id].slug === slug);
+    const previousRenderUrl = entryId ? state[entryId].renderUrl : undefined;
+
+    const fieldData = {
+      [fields.render.id]: { type: "string", value: "" },
+    };
+    if (fields.marker) {
+      fieldData[fields.marker.id] = { type: "string", value: "" };
+    }
+
+    await withRetries(`clear-and-verify:${slug}`, async () => {
+      await item.setAttributes({ fieldData });
+      await sleep(2000);
+      const freshItems = await collection.getItems();
+      const freshItem = freshItems.find((i) => i.slug === slug);
+      const renderValue = freshItem?.fieldData[fields.render.id]?.value;
+      if (renderValue !== "") {
+        throw new Error(`Clearing render field did not persist (got "${renderValue}")`);
+      }
+    }, 5);
+
+    if (entryId) delete state[entryId];
+    // Keep the last known URL around under the slug so a rollback is still
+    // possible even after the state entry itself is gone.
+    if (previousRenderUrl) {
+      state[`removed:${slug}`] = { slug, renderUrl: "", previousRenderUrl };
+    }
+    saveState(state);
+
+    console.log(`Cleared "${slug}" — upload was removed.`);
+  });
+}
+
 async function main() {
   if (!FRAMER_API_KEY || !FRAMER_PROJECT_URL) {
     throw new Error("Missing FRAMER_API_KEY or FRAMER_PROJECT_URL environment variable/secret.");
@@ -230,40 +325,57 @@ async function main() {
   // comparing Framer's current upload field (always read reliably) against
   // this repo's own record of what was last synced (also always reliable —
   // it's a local file, not a cross-session Framer read).
-  const toProcess = await withFreshCollection(async (_framer, collection, fields) => {
+  const { toProcess, toClear } = await withFreshCollection(async (_framer, collection, fields) => {
     const items = await collection.getItems();
     console.log(`Checking ${items.length} item(s) in "${COLLECTION_NAME}"...`);
 
     const pending = [];
+    const clearing = [];
     for (const item of items) {
       const asset = item.fieldData[fields.upload.id]?.value;
-      if (!asset?.url) continue;
-      const lastSynced = state[item.id]?.lastSyncedSourceAssetId;
-      if (lastSynced === asset.id) continue;
+      const previouslySynced = Object.values(state).some(
+        (entry) => entry.slug === item.slug && entry.lastSyncedSourceAssetId
+      );
+
+      if (!asset?.url) {
+        if (previouslySynced) clearing.push(item.slug);
+        continue;
+      }
+
+      const stateEntry = Object.values(state).find((entry) => entry.slug === item.slug);
+      if (stateEntry?.lastSyncedSourceAssetId === asset.id) continue;
       pending.push(item.slug);
     }
-    return pending;
+    return { toProcess: pending, toClear: clearing };
   });
 
   console.log(`${toProcess.length} item(s) need processing: ${toProcess.join(", ") || "(none)"}`);
+  if (toClear.length > 0) {
+    console.log(`${toClear.length} item(s) had their upload removed and need clearing: ${toClear.join(", ")}`);
+  }
 
   let processed = 0;
   let failed = 0;
+  const allWork = [...toProcess.map((slug) => ({ slug, kind: "process" })), ...toClear.map((slug) => ({ slug, kind: "clear" }))];
 
-  for (let i = 0; i < toProcess.length; i++) {
-    const slug = toProcess[i];
-    console.log(`Processing "${slug}"...`);
+  for (let i = 0; i < allWork.length; i++) {
+    const { slug, kind } = allWork[i];
+    console.log(`${kind === "process" ? "Processing" : "Clearing"} "${slug}"...`);
     try {
-      await processItem(slug, state);
+      if (kind === "process") {
+        await processItem(slug, state);
+      } else {
+        await clearItem(slug, state);
+      }
       processed++;
     } catch (error) {
-      console.error(`Failed to process "${slug}": ${error.message}`);
+      console.error(`Failed to ${kind} "${slug}": ${error.message}`);
       failed++;
     }
     // Deliberate pause between items' connect/disconnect cycles — testing
     // showed back-to-back cycles with no gap caused writes to intermittently
     // fail to persist.
-    if (i < toProcess.length - 1) {
+    if (i < allWork.length - 1) {
       await sleep(5000);
     }
   }

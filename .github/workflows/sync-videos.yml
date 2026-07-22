@@ -2,9 +2,9 @@ name: Sync Commission Videos
 
 on:
   schedule:
-    # Daily at 03:17 UTC (off-minute, low-traffic time). Adjust freely — this
-    # isn't latency sensitive, Catherine's uploads are infrequent.
-    - cron: "17 3 * * *"
+    # TEMPORARY for testing autonomous firing — will be reset to the real
+    # daily schedule right after confirming this fires on its own.
+    - cron: "25 22 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -38,13 +38,18 @@ jobs:
           FRAMER_PROJECT_URL: ${{ secrets.FRAMER_PROJECT_URL }}
         run: npm run sync
 
-      - name: Commit updated sync state
+      - name: Commit updated sync state and heartbeat
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- .sync-state.json; then
-            git add .sync-state.json
-            git commit -m "Update sync state"
+          # GitHub auto-disables scheduled workflows after 60 days with no
+          # COMMITS to the repo (workflow runs themselves don't count,
+          # confirmed via GitHub's own docs). This file guarantees a commit
+          # every day this runs, so that can never happen silently.
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .last-run.txt
+          git add .sync-state.json .last-run.txt
+          if ! git diff --cached --quiet; then
+            git commit -m "Sync run: $(date -u +%Y-%m-%d)"
             git push
           fi
