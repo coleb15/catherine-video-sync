@@ -201,7 +201,15 @@ async function processItem(slug, state) {
       }, 5);
 
       // The authoritative "already synced" record — this repo, not Framer.
-      state[item.id] = { slug, lastSyncedSourceAssetId: asset.id };
+      // Keeps the previous render URL too, so a bad sync can be rolled back
+      // with `node scripts/rollback.mjs <slug>` (see README).
+      const previousRenderUrl = state[item.id]?.renderUrl;
+      state[item.id] = {
+        slug,
+        lastSyncedSourceAssetId: asset.id,
+        renderUrl: uploaded.url,
+        previousRenderUrl,
+      };
       saveState(state);
 
       console.log(`Synced "${slug}" -> ${uploaded.url}`);

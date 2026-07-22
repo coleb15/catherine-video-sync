@@ -6,7 +6,8 @@
   "description": "Watches the Catherine Orchard Framer site's Commissions CMS collection for new video uploads, optimizes them, and syncs the result back — so future uploads work without manual intervention.",
   "scripts": {
     "sync": "node scripts/sync-videos.mjs",
-    "check-pricing": "node scripts/check-pricing.mjs"
+    "check-pricing": "node scripts/check-pricing.mjs",
+    "rollback": "node scripts/rollback.mjs"
   },
   "dependencies": {
     "framer-api": "0.1.24"

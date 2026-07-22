@@ -1,5 +1,44 @@
 # Catherine Orchard — Commission Video Sync
 
+## 🚨 If something's broken right now
+
+**Step 1 — stop it immediately (always safe, takes 5 seconds):**
+
+```
+gh workflow disable sync-videos.yml --repo coleb15/catherine-video-sync
+```
+
+This cannot break the live site further. The automation is a background job — it doesn't
+run at the moment someone visits the site, it only runs on its own schedule. Disabling it
+just means nothing more happens automatically until you re-enable it. Whatever was last
+correctly synced keeps working exactly as before.
+
+**Step 2 — if one specific video looks wrong on the live site**, revert just that item to
+whatever it was before the last sync touched it:
+
+```
+npm run rollback -- <item-slug>
+```
+
+(the slug is the last part of its Commissions URL, e.g. `nylon` for `/commissions/nylon`)
+
+This reads `.sync-state.json` and writes the previous known-good value straight back —
+no guessing. Commit and push the updated `.sync-state.json` afterward so the reversion
+sticks. If the script itself won't run for some reason, the fallback is: open the item in
+the Framer CMS editor and paste a working URL directly into "Video URL (if applicable)" —
+that field is a plain string, editable by hand like any other.
+
+**Step 3 — once it's stable, do the real fix without time pressure.** Re-enable when ready:
+
+```
+gh workflow enable sync-videos.yml --repo coleb15/catherine-video-sync
+```
+
+Both the disable and rollback commands were tested for real against this repo and
+project, not just written and assumed to work.
+
+---
+
 Automates what used to be a manual step: when Catherine uploads a new video into the
 "Video File (if applicable)" field on a Commissions CMS item in Framer, this re-encodes
 it to a smaller web-friendly size and writes the result into "Video URL (if applicable)"
@@ -83,7 +122,7 @@ source of truth without re-testing cross-session read consistency rigorously fir
   Site Settings → General → API Keys.
 - `FRAMER_PROJECT_URL` — the Framer project URL.
 
-## If something breaks
+## Debugging (once things are stable — see the emergency section at the top for right now)
 
 Check the Actions tab for the failed run's logs first — the script is written to fail
 loudly with a specific reason (missing field, missing collection, download/upload
