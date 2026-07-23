@@ -60,50 +60,64 @@ const MARKER_FIELD_NAME = "Last Synced Source Asset";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = join(__dirname, "..", ".sync-state.json");
 
-const AUDIO_BITRATE_KBPS = 128;
-// Deliberately low — this is a last-resort floor for pathologically long
-// uploads, not a quality target. Confirmed via calculation that a higher
-// floor (e.g. 400kbps) would override and defeat the size-safety target for
-// anything longer than ~6.5 minutes, including the first real long video
-// this ran on (13 minutes, needed ~184kbps to hit budget). Below ~14.7
-// minutes this floor never actually engages — the duration-based target
-// wins. Only videos longer than that trade further quality for guaranteed
-// upload success, which is the right tradeoff vs. failing to upload at all.
-const MIN_VIDEO_BITRATE_KBPS = 150;
+const MAX_AUDIO_BITRATE_KBPS = 128;
+const MIN_AUDIO_BITRATE_KBPS = 48;
+const MIN_VIDEO_BITRATE_KBPS = 100;
 const MAX_VIDEO_BITRATE_KBPS = 3000;
-// Raw-bytes uploads to the Server API have a hard size ceiling — confirmed
-// directly via testing: 38MB succeeded, 82MB failed with a WebSocket
-// "message too big" close (code 1009). Most commission clips are short
-// enough that the fixed 3000k cap below was never close to this, but one
-// unusually long video (13 minutes) produced a 160MB "optimized" file at
-// that fixed rate — which would have failed to upload. The bitrate is now
-// calculated per-item from its duration so the output always stays safely
-// under the confirmed ceiling, regardless of how long a future upload is.
-const MAX_UPLOAD_SAFETY_MB = 30;
+// Raw-bytes uploads to the Server API have a real size ceiling. Confirmed
+// directly, and it's tighter — and less consistent — from inside GitHub
+// Actions than from a local machine: 38MB succeeded locally, but a 31MB
+// upload failed identically 3 times in a row (including with 6 retries)
+// when run from the actual deployed GitHub Actions workflow, always with
+// the same "Connection closed" (WebSocket code 1006). Most commission clips
+// are short enough that the fixed 3000k cap below was never anywhere close
+// to this, but one unusually long video (13 minutes) produced a 160MB
+// "optimized" file at that fixed rate, which would have failed outright.
+// Set conservatively low specifically because the reliable ceiling from
+// Actions' own network environment is meaningfully tighter than what a
+// local machine can get away with.
+const MAX_UPLOAD_SAFETY_MB = 15;
 
-function buildFfmpegArgs(maxrateKbps) {
-  const bufsizeKbps = maxrateKbps * 2;
+function buildFfmpegArgs(videoKbps, audioKbps) {
+  const bufsizeKbps = videoKbps * 2;
   return [
     "-vf", "scale=960:-2",
     "-pix_fmt", "yuv420p",
     "-c:v", "libx264",
     "-preset", "slow",
     "-crf", "20",
-    "-maxrate", `${maxrateKbps}k`,
+    "-maxrate", `${videoKbps}k`,
     "-bufsize", `${bufsizeKbps}k`,
     "-c:a", "aac",
-    "-b:a", `${AUDIO_BITRATE_KBPS}k`,
+    "-b:a", `${audioKbps}k`,
     "-movflags", "+faststart",
   ];
 }
 
-// Picks a video bitrate that keeps the encoded file comfortably under the
-// confirmed upload ceiling for however long the source actually is, rather
-// than assuming every upload is a short clip.
-function computeMaxrateKbps(durationSeconds) {
-  const targetTotalKbits = MAX_UPLOAD_SAFETY_MB * 8 * 1024;
-  const videoKbps = Math.round(targetTotalKbits / durationSeconds - AUDIO_BITRATE_KBPS);
-  return Math.min(MAX_VIDEO_BITRATE_KBPS, Math.max(MIN_VIDEO_BITRATE_KBPS, videoKbps));
+// Picks video + audio bitrates that keep the encoded file under the
+// confirmed-safe upload size for however long the source actually is.
+// Audio's floor is subtracted from the SAME total budget video draws from
+// (rather than treating audio as a separate fixed cost), so a long-video
+// floor on one doesn't silently blow the total past target the way a fixed
+// audio constant did in an earlier version of this — confirmed via
+// calculation that 128kbps fixed audio alone exceeds a 15MB budget past
+// about 15 minutes.
+//
+// This still isn't unconditionally bulletproof — for a source long enough
+// that even both floors together exceed budget, checkOutputSanity() below
+// will catch the oversized result and fail loudly rather than let a
+// doomed upload attempt run. That's an accepted limit for a rare edge
+// case, not silently handled indefinitely.
+function computeBitrates(durationSeconds) {
+  const totalBudgetKbps = (MAX_UPLOAD_SAFETY_MB * 8 * 1024) / durationSeconds;
+
+  const audioShare = totalBudgetKbps * 0.15;
+  const audioKbps = Math.round(Math.min(MAX_AUDIO_BITRATE_KBPS, Math.max(MIN_AUDIO_BITRATE_KBPS, audioShare)));
+
+  const remainingForVideo = totalBudgetKbps - audioKbps;
+  const videoKbps = Math.round(Math.min(MAX_VIDEO_BITRATE_KBPS, Math.max(MIN_VIDEO_BITRATE_KBPS, remainingForVideo)));
+
+  return { videoKbps, audioKbps };
 }
 
 const MIN_OUTPUT_BYTES = 20_000; // catches empty/near-empty output
@@ -265,13 +279,13 @@ async function processItem(slug, state) {
       });
 
       const sourceDuration = getDurationSeconds(rawPath);
-      const maxrateKbps = computeMaxrateKbps(sourceDuration);
+      const { videoKbps, audioKbps } = computeBitrates(sourceDuration);
       console.log(
-        `Source duration: ${sourceDuration.toFixed(1)}s -> encoding at ${maxrateKbps}kbps video ` +
-        `(target: under ~${MAX_UPLOAD_SAFETY_MB}MB)`
+        `Source duration: ${sourceDuration.toFixed(1)}s -> encoding at ${videoKbps}kbps video + ` +
+        `${audioKbps}kbps audio (target: under ~${MAX_UPLOAD_SAFETY_MB}MB)`
       );
 
-      execFileSync("ffmpeg", ["-y", "-i", rawPath, ...buildFfmpegArgs(maxrateKbps), optimizedPath], { stdio: "inherit" });
+      execFileSync("ffmpeg", ["-y", "-i", rawPath, ...buildFfmpegArgs(videoKbps, audioKbps), optimizedPath], { stdio: "inherit" });
 
       checkOutputSanity(rawPath, optimizedPath);
 
