@@ -128,17 +128,26 @@ function saveState(state) {
   writeFileSync(STATE_PATH, JSON.stringify(state, null, 2) + "\n");
 }
 
-async function withRetries(label, fn, attempts = 3) {
+// alwaysRetryOn: extra patterns to treat as retryable regardless of what the
+// SDK's own isRetryableError() says. Added after confirming directly that
+// "Connection closed" (WebSocket code 1006, an abnormal closure — distinct
+// from 1009 "message too big", which is a real size problem not worth
+// retrying) sometimes gets classified as non-retryable on the SECOND
+// attempt even though retrying again does eventually succeed. Larger
+// uploads (tens of MB, vs. the few MB most commission clips need) seem
+// more prone to this — reproduced twice in a row on the same 31MB upload.
+async function withRetries(label, fn, attempts = 3, { alwaysRetryOn = [] } = {}) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       return await fn();
     } catch (error) {
       lastError = error;
-      const retryable = isRetryableError(error);
+      const forceRetry = alwaysRetryOn.some((pattern) => pattern.test(error.message ?? ""));
+      const retryable = forceRetry || isRetryableError(error);
       console.warn(`[${label}] attempt ${attempt}/${attempts} failed${retryable ? " (retryable)" : ""}: ${error.message}`);
       if (!retryable || attempt === attempts) break;
-      await sleep(2000 * attempt);
+      await sleep(3000 * attempt);
     }
   }
   throw lastError;
@@ -268,11 +277,15 @@ async function processItem(slug, state) {
 
       const optimizedBytes = readFileSync(optimizedPath);
 
-      const uploaded = await withRetries(`upload:${slug}`, () =>
-        framer.uploadFile({
-          name: `optimized-${slug}.mp4`,
-          file: { bytes: optimizedBytes, mimeType: "video/mp4" },
-        })
+      const uploaded = await withRetries(
+        `upload:${slug}`,
+        () =>
+          framer.uploadFile({
+            name: `optimized-${slug}.mp4`,
+            file: { bytes: optimizedBytes, mimeType: "video/mp4" },
+          }),
+        6,
+        { alwaysRetryOn: [/connection closed/i] }
       );
 
       const fieldData = {
