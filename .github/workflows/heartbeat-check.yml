@@ -1,0 +1,55 @@
+name: Sync Heartbeat Watchdog
+
+# Independent of sync-videos.yml on purpose. If the primary workflow's cron
+# ever silently stops firing entirely — disabled, broken YAML, GitHub
+# scheduling issue, quota, whatever — there's no failed run to email about,
+# because there's no run at all. This is a separate scheduled job whose only
+# purpose is to notice that silence and fail loudly (which DOES trigger a
+# GitHub Actions failure email) when the primary hasn't checked in recently.
+#
+# Threshold confirmed generous relative to real behavior: GitHub's own
+# schedule for the primary workflow (`*/5 * * * *`) has been observed to
+# genuinely lag by 2-4 hours during quiet periods (checked via `gh run
+# list` — legitimate GitHub-side scheduling gaps, not failures). 12 hours
+# gives a wide safety margin above that before treating it as a real
+# problem.
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  check-heartbeat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify primary sync workflow has checked in recently
+        run: |
+          if [ ! -f .last-run.txt ]; then
+            echo "::error::.last-run.txt is missing entirely — the sync workflow has never written a heartbeat, or the file was deleted."
+            exit 1
+          fi
+
+          LAST_RUN=$(cat .last-run.txt)
+          LAST_RUN_EPOCH=$(date -u -d "$LAST_RUN" +%s 2>/dev/null)
+          NOW_EPOCH=$(date -u +%s)
+
+          if [ -z "$LAST_RUN_EPOCH" ]; then
+            echo "::error::.last-run.txt contains an unparseable timestamp: \"$LAST_RUN\""
+            exit 1
+          fi
+
+          AGE_SECONDS=$((NOW_EPOCH - LAST_RUN_EPOCH))
+          AGE_HOURS=$((AGE_SECONDS / 3600))
+          THRESHOLD_SECONDS=$((12 * 3600))
+
+          echo "Last sync heartbeat: $LAST_RUN ($AGE_HOURS hour(s) ago)"
+
+          if [ "$AGE_SECONDS" -gt "$THRESHOLD_SECONDS" ]; then
+            echo "::error::Sync Commission Videos hasn't checked in for $AGE_HOURS hour(s) — it may have stopped running entirely. Check the Actions tab for that workflow directly."
+            exit 1
+          fi
+
+          echo "OK — within the 12-hour threshold."
