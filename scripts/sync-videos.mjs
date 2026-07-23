@@ -78,6 +78,16 @@ const MAX_VIDEO_BITRATE_KBPS = 3000;
 // local machine can get away with.
 const MAX_UPLOAD_SAFETY_MB = 15;
 
+// Without an explicit timeout, a pathological source file that makes ffmpeg
+// hang would run until GitHub Actions' own job-level timeout kills the
+// ENTIRE run — taking every other queued item down with it, not just the
+// bad one, and losing the clean "N item(s) failed" signal this script is
+// designed to give. Confirmed via testing that execFileSync's timeout
+// option does kill a hung child process and throws, which the existing
+// per-item try/catch in main() already handles correctly.
+const FFMPEG_TIMEOUT_MS = 8 * 60 * 1000;
+const FFPROBE_TIMEOUT_MS = 30 * 1000;
+
 function buildFfmpegArgs(videoKbps, audioKbps) {
   const bufsizeKbps = videoKbps * 2;
   return [
@@ -173,7 +183,7 @@ function getDurationSeconds(path) {
     "-show_entries", "format=duration",
     "-of", "default=noprint_wrappers=1:nokey=1",
     path,
-  ]).toString().trim();
+  ], { timeout: FFPROBE_TIMEOUT_MS }).toString().trim();
   const seconds = parseFloat(out);
   if (Number.isNaN(seconds)) throw new Error(`ffprobe returned a non-numeric duration: "${out}"`);
   return seconds;
@@ -299,7 +309,10 @@ async function processItem(slug, state) {
       `${audioKbps}kbps audio (target: under ~${MAX_UPLOAD_SAFETY_MB}MB)`
     );
 
-    execFileSync("ffmpeg", ["-y", "-i", rawPath, ...buildFfmpegArgs(videoKbps, audioKbps), optimizedPath], { stdio: "inherit" });
+    execFileSync("ffmpeg", ["-y", "-i", rawPath, ...buildFfmpegArgs(videoKbps, audioKbps), optimizedPath], {
+      stdio: "inherit",
+      timeout: FFMPEG_TIMEOUT_MS,
+    });
 
     checkOutputSanity(rawPath, optimizedPath);
 
