@@ -60,21 +60,55 @@ const MARKER_FIELD_NAME = "Last Synced Source Asset";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = join(__dirname, "..", ".sync-state.json");
 
-const FFMPEG_ARGS = [
-  "-vf", "scale=960:-2",
-  "-pix_fmt", "yuv420p",
-  "-c:v", "libx264",
-  "-preset", "slow",
-  "-crf", "20",
-  "-maxrate", "3000k",
-  "-bufsize", "6000k",
-  "-c:a", "aac",
-  "-b:a", "128k",
-  "-movflags", "+faststart",
-];
+const AUDIO_BITRATE_KBPS = 128;
+// Deliberately low — this is a last-resort floor for pathologically long
+// uploads, not a quality target. Confirmed via calculation that a higher
+// floor (e.g. 400kbps) would override and defeat the size-safety target for
+// anything longer than ~6.5 minutes, including the first real long video
+// this ran on (13 minutes, needed ~184kbps to hit budget). Below ~14.7
+// minutes this floor never actually engages — the duration-based target
+// wins. Only videos longer than that trade further quality for guaranteed
+// upload success, which is the right tradeoff vs. failing to upload at all.
+const MIN_VIDEO_BITRATE_KBPS = 150;
+const MAX_VIDEO_BITRATE_KBPS = 3000;
+// Raw-bytes uploads to the Server API have a hard size ceiling — confirmed
+// directly via testing: 38MB succeeded, 82MB failed with a WebSocket
+// "message too big" close (code 1009). Most commission clips are short
+// enough that the fixed 3000k cap below was never close to this, but one
+// unusually long video (13 minutes) produced a 160MB "optimized" file at
+// that fixed rate — which would have failed to upload. The bitrate is now
+// calculated per-item from its duration so the output always stays safely
+// under the confirmed ceiling, regardless of how long a future upload is.
+const MAX_UPLOAD_SAFETY_MB = 30;
+
+function buildFfmpegArgs(maxrateKbps) {
+  const bufsizeKbps = maxrateKbps * 2;
+  return [
+    "-vf", "scale=960:-2",
+    "-pix_fmt", "yuv420p",
+    "-c:v", "libx264",
+    "-preset", "slow",
+    "-crf", "20",
+    "-maxrate", `${maxrateKbps}k`,
+    "-bufsize", `${bufsizeKbps}k`,
+    "-c:a", "aac",
+    "-b:a", `${AUDIO_BITRATE_KBPS}k`,
+    "-movflags", "+faststart",
+  ];
+}
+
+// Picks a video bitrate that keeps the encoded file comfortably under the
+// confirmed upload ceiling for however long the source actually is, rather
+// than assuming every upload is a short clip.
+function computeMaxrateKbps(durationSeconds) {
+  const targetTotalKbits = MAX_UPLOAD_SAFETY_MB * 8 * 1024;
+  const videoKbps = Math.round(targetTotalKbits / durationSeconds - AUDIO_BITRATE_KBPS);
+  return Math.min(MAX_VIDEO_BITRATE_KBPS, Math.max(MIN_VIDEO_BITRATE_KBPS, videoKbps));
+}
 
 const MIN_OUTPUT_BYTES = 20_000; // catches empty/near-empty output
 const DURATION_TOLERANCE_SECONDS = 3; // vs. the source's own duration
+const MAX_OUTPUT_BYTES = MAX_UPLOAD_SAFETY_MB * 1.15 * 1024 * 1024; // small margin over the target for encoder overshoot
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -129,6 +163,15 @@ function checkOutputSanity(rawPath, optimizedPath) {
   const size = statSync(optimizedPath).size;
   if (size < MIN_OUTPUT_BYTES) {
     throw new Error(`Optimized output is suspiciously small (${size} bytes) — likely a broken/corrupt source file.`);
+  }
+  if (size > MAX_OUTPUT_BYTES) {
+    // Catches encoder overshoot on unusual content (e.g. very high motion)
+    // before it fails obscurely at the upload step instead.
+    throw new Error(
+      `Optimized output (${(size / 1024 / 1024).toFixed(1)}MB) still exceeds the safe upload ` +
+      `size (~${MAX_UPLOAD_SAFETY_MB}MB) despite the duration-based bitrate calculation — ` +
+      `likely unusually complex content. Needs manual review, not an automatic retry.`
+    );
   }
 
   const sourceDuration = getDurationSeconds(rawPath);
@@ -212,7 +255,14 @@ async function processItem(slug, state) {
         writeFileSync(rawPath, buffer);
       });
 
-      execFileSync("ffmpeg", ["-y", "-i", rawPath, ...FFMPEG_ARGS, optimizedPath], { stdio: "inherit" });
+      const sourceDuration = getDurationSeconds(rawPath);
+      const maxrateKbps = computeMaxrateKbps(sourceDuration);
+      console.log(
+        `Source duration: ${sourceDuration.toFixed(1)}s -> encoding at ${maxrateKbps}kbps video ` +
+        `(target: under ~${MAX_UPLOAD_SAFETY_MB}MB)`
+      );
+
+      execFileSync("ffmpeg", ["-y", "-i", rawPath, ...buildFfmpegArgs(maxrateKbps), optimizedPath], { stdio: "inherit" });
 
       checkOutputSanity(rawPath, optimizedPath);
 
