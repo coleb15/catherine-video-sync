@@ -253,43 +253,65 @@ async function withFreshCollection(work) {
   }
 }
 
+// Split into two connection phases rather than one held open for the whole
+// item. Confirmed directly necessary: uploads consistently failed with a
+// WebSocket "Connection closed" (code 1006) for a video whose encoding step
+// alone took ~1m45s of pure local ffmpeg work with zero Framer network
+// activity — lowering the target file size repeatedly (31MB, then 16MB)
+// made no difference, which ruled out size as the actual cause. The
+// working theory: a connection opened before that long an idle gap can go
+// stale by the time the upload finally happens. Every short commission
+// clip's encode finishes in seconds, so this never showed up before.
+// Opening a brand-new connection specifically for the upload+write phase,
+// AFTER the slow offline work is done, avoids the idle gap entirely.
 async function processItem(slug, state) {
-  return withFreshCollection(async (framer, collection, fields) => {
+  const asset = await withFreshCollection(async (_framer, collection, fields) => {
     const items = await collection.getItems();
     const item = items.find((i) => i.slug === slug);
     if (!item) {
       throw new Error(`Item "${slug}" disappeared between the scan pass and processing.`);
     }
-
     const asset = item.fieldData[fields.upload.id]?.value;
     if (!asset?.url) {
       throw new Error(`Item "${slug}" no longer has an upload — skipping.`);
     }
+    return asset;
+  });
 
-    const workDir = mkdtempSync(join(tmpdir(), "video-sync-"));
-    const rawPath = join(workDir, "raw.mp4");
-    const optimizedPath = join(workDir, "optimized.mp4");
+  const workDir = mkdtempSync(join(tmpdir(), "video-sync-"));
+  const rawPath = join(workDir, "raw.mp4");
+  const optimizedPath = join(workDir, "optimized.mp4");
 
-    try {
-      await withRetries(`download:${slug}`, async () => {
-        const res = await fetch(asset.url);
-        if (!res.ok) throw new Error(`Download failed with status ${res.status}`);
-        const buffer = Buffer.from(await res.arrayBuffer());
-        writeFileSync(rawPath, buffer);
-      });
+  try {
+    // Everything in this block is offline — no Framer connection held open
+    // while it runs, however long it takes.
+    await withRetries(`download:${slug}`, async () => {
+      const res = await fetch(asset.url);
+      if (!res.ok) throw new Error(`Download failed with status ${res.status}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      writeFileSync(rawPath, buffer);
+    });
 
-      const sourceDuration = getDurationSeconds(rawPath);
-      const { videoKbps, audioKbps } = computeBitrates(sourceDuration);
-      console.log(
-        `Source duration: ${sourceDuration.toFixed(1)}s -> encoding at ${videoKbps}kbps video + ` +
-        `${audioKbps}kbps audio (target: under ~${MAX_UPLOAD_SAFETY_MB}MB)`
-      );
+    const sourceDuration = getDurationSeconds(rawPath);
+    const { videoKbps, audioKbps } = computeBitrates(sourceDuration);
+    console.log(
+      `Source duration: ${sourceDuration.toFixed(1)}s -> encoding at ${videoKbps}kbps video + ` +
+      `${audioKbps}kbps audio (target: under ~${MAX_UPLOAD_SAFETY_MB}MB)`
+    );
 
-      execFileSync("ffmpeg", ["-y", "-i", rawPath, ...buildFfmpegArgs(videoKbps, audioKbps), optimizedPath], { stdio: "inherit" });
+    execFileSync("ffmpeg", ["-y", "-i", rawPath, ...buildFfmpegArgs(videoKbps, audioKbps), optimizedPath], { stdio: "inherit" });
 
-      checkOutputSanity(rawPath, optimizedPath);
+    checkOutputSanity(rawPath, optimizedPath);
 
-      const optimizedBytes = readFileSync(optimizedPath);
+    const optimizedBytes = readFileSync(optimizedPath);
+
+    // Fresh connection, opened right before it's actually needed.
+    await withFreshCollection(async (framer, collection, fields) => {
+      const items = await collection.getItems();
+      const item = items.find((i) => i.slug === slug);
+      if (!item) {
+        throw new Error(`Item "${slug}" disappeared between encoding and upload.`);
+      }
 
       const uploaded = await withRetries(
         `upload:${slug}`,
@@ -340,10 +362,10 @@ async function processItem(slug, state) {
       saveState(state);
 
       console.log(`Synced "${slug}" -> ${uploaded.url}`);
-    } finally {
-      rmSync(workDir, { recursive: true, force: true });
-    }
-  });
+    });
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
 }
 
 // Handles an item that WAS previously synced by this script but no longer
